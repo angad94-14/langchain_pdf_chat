@@ -2,143 +2,167 @@ import streamlit as st
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from langchain.text_splitter import CharacterTextSplitter
-from langchain_core.prompts import PromptTemplate
 from langchain_openai import OpenAIEmbeddings, OpenAI
 from langchain_community.vectorstores import FAISS
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
-from langchain.memory import ConversationBufferMemory
+from langchain.memory import ConversationBufferMemory, ConversationSummaryMemory
+from langchain_core.prompts import PromptTemplate
+from langchain.chains import LLMChain
 
 
-def get_memory():
-    """Get or create memory object"""
-    if "memory" not in st.session_state:
-        st.session_state.memory = ConversationBufferMemory(
-            memory_key="history",
+def initialize_memories():
+    if "main_memory" not in st.session_state:
+        st.session_state.main_memory = ConversationBufferMemory(
+            memory_key="chat_history",
             return_messages=True
         )
-    return st.session_state.memory
+
+    if "summary_memory" not in st.session_state:
+        st.session_state.summary_memory = ConversationSummaryMemory(
+            llm=OpenAI(),
+            memory_key="summary_history",
+            return_messages=True
+        )
 
 
-def display_chat_history():
-    """Display the chat history in a conversational format"""
-    memory = get_memory()
-    messages = memory.load_memory_variables({})["history"]
+def create_research_chains(llm):
+    # Chain for extracting key concepts
+    concept_prompt = PromptTemplate(
+        input_variables=["context", "question"],
+        template="Extract key concepts from: {context}\nFor question: {question}\nKey concepts:"
+    )
+    concept_chain = LLMChain(llm=llm, prompt=concept_prompt)
 
-    # Create a container for chat history
-    chat_container = st.container()
+    # Chain for finding supporting evidence
+    evidence_prompt = PromptTemplate(
+        input_variables=["context", "question"],
+        template="Find supporting evidence for this question: {question}\nIn context: {context}\nEvidence:"
+    )
+    evidence_chain = LLMChain(llm=llm, prompt=evidence_prompt)
 
-    with chat_container:
-        for msg in messages:
-            # Check if the message is a string (older format) or a Message object
-            if isinstance(msg, str):
-                st.write(msg)
-            else:
-                # For Message objects, check the type and display accordingly
-                if msg.type == 'human':
-                    st.write(f"👤 **You:** {msg.content}")
-                else:
-                    st.write(f"🤖 **Assistant:** {msg.content}")
+    # Chain for generating counter-arguments
+    counter_prompt = PromptTemplate(
+        input_variables=["context", "question"],
+        template="Generate potential counter-arguments for this question: {question}\nUsing context: {context}\nCounter-arguments:"
+    )
+    counter_chain = LLMChain(llm=llm, prompt=counter_prompt)
 
-        # Add a divider after the history
-        if messages:
-            st.divider()
+    return concept_chain, evidence_chain, counter_chain
 
 
 def main():
-    # Load environment variables
     load_dotenv()
+    st.set_page_config(page_title='Advanced Research Assistant', page_icon='🔬')
+    st.header('Research Assistant with Multi-Perspective Analysis 🔬')
 
-    # Set up Streamlit page
-    st.set_page_config(page_title='Langchain PDF Chat', page_icon='📄')
-    st.header('Chat with your PDF')
+    # Initialize memories
+    initialize_memories()
 
-    # Initialize memory at the start of the app
-    memory = get_memory()
-
-    # Initialize knowledge base in session state
+    # Initialize knowledge base
     if "knowledge_base" not in st.session_state:
         st.session_state.knowledge_base = None
 
-    # Upload PDF
-    pdf = st.file_uploader("Upload a PDF file", type=["pdf"])
+    # File upload - support multiple PDFs
+    pdfs = st.file_uploader("Upload research papers", type=["pdf"], accept_multiple_files=True)
 
-    # Process the PDF and store embeddings persistently
-    if pdf is not None and st.session_state.knowledge_base is None:
-        pdf_reader = PdfReader(pdf)
-        text = ''
+    if pdfs and st.session_state.knowledge_base is None:
+        with st.spinner('Processing documents...'):
+            text = ''
+            for pdf in pdfs:
+                pdf_reader = PdfReader(pdf)
+                for page in pdf_reader.pages:
+                    text += page.extract_text() + "\n"
 
-        # Extract text from each page of the PDF
-        for page in pdf_reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
+            splitter = CharacterTextSplitter(
+                separator='\n',
+                chunk_size=1000,
+                chunk_overlap=200,
+                length_function=len
+            )
+            chunks = splitter.split_text(text)
 
-        # Split text into chunks for better retrieval
-        splitter = CharacterTextSplitter(
-            separator='\n',
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len
-        )
-        chunks = splitter.split_text(text)
+            embeddings = OpenAIEmbeddings()
+            st.session_state.knowledge_base = FAISS.from_texts(chunks, embeddings)
+            st.success("Documents processed! Ready for research.")
 
-        # Convert text into embeddings and store in FAISS
-        embeddings = OpenAIEmbeddings()
-        st.session_state.knowledge_base = FAISS.from_texts(chunks, embeddings)
+    # Research query input
+    research_question = st.text_input("Enter your research question:")
 
-        st.write("PDF processed. You can now ask questions.")
+    if research_question and st.session_state.knowledge_base:
+        # Retrieve relevant documents
+        docs = st.session_state.knowledge_base.similarity_search(research_question)
 
-    # Display chat history before the input box
-    display_chat_history()
+        # Convert docs to string for context
+        context = "\n\n".join([doc.page_content for doc in docs])
 
-    # Get user query
-    user_question = st.text_input("Ask a question!")
+        # Initialize LLM and chains
+        llm = OpenAI(temperature=0.7)
+        concept_chain, evidence_chain, counter_chain = create_research_chains(llm)
 
-    if user_question and st.session_state.knowledge_base:
-        # Retrieve relevant document chunks from FAISS
-        docs = st.session_state.knowledge_base.similarity_search(user_question)
-
-        # Define a prompt template
-        prompt = PromptTemplate(
-            input_variables=["history", "context", "question"],
-            template=(
-                "You are a helpful assistant. Use the chat history and the given context to answer the question.\n\n"
-                "Chat History:\n{history}\n\n"
-                "Context:\n{context}\n\n"
-                "Question: {question}\n\n"
-                "Answer:"
+        # Create parallel processing pipeline with independent chains
+        research_chain = RunnableParallel(
+            concepts=lambda x: concept_chain.run(
+                context=x["context"],
+                question=x["question"]
+            ),
+            evidence=lambda x: evidence_chain.run(
+                context=x["context"],
+                question=x["question"]
+            ),
+            counter_arguments=lambda x: counter_chain.run(
+                context=x["context"],
+                question=x["question"]
             )
         )
 
-        # Instantiate OpenAI LLM
-        llm = OpenAI()
+        # Process research with proper input structure
+        with st.spinner('Analyzing...'):
+            result = research_chain.invoke({
+                "context": context,
+                "question": research_question
+            })
 
-        # Function to retrieve conversation history
-        def get_chat_history(_):
-            return memory.load_memory_variables({})["history"]
-
-        # Create a processing pipeline using RunnableParallel
-        chain = (
-                RunnableParallel(
-                    history=RunnablePassthrough() | get_chat_history,
-                    context=RunnablePassthrough(),
-                    question=RunnablePassthrough()
-                )
-                | prompt
-                | llm
+        # Save to memories
+        st.session_state.main_memory.save_context(
+            {"input": research_question},
+            {"output": f"Analysis Results:\n{result}"}
         )
 
-        # Invoke chain
-        result = chain.invoke({"context": docs, "question": user_question})
-
-        # Save conversation history
-        memory.save_context(
-            {"input": user_question},
-            {"output": result}
+        st.session_state.summary_memory.save_context(
+            {"input": research_question},
+            {"output": f"Key Findings: {result['concepts']}"}
         )
 
-        # Clear the input box after sending (optional)
-        st.empty()
+        # Display results in organized tabs
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "Key Concepts",
+            "Supporting Evidence",
+            "Counter Arguments",
+            "Research History"
+        ])
+
+        with tab1:
+            st.markdown("### Key Concepts Identified")
+            st.write(result["concepts"])
+
+        with tab2:
+            st.markdown("### Supporting Evidence")
+            st.write(result["evidence"])
+
+        with tab3:
+            st.markdown("### Counter Arguments")
+            st.write(result["counter_arguments"])
+
+        with tab4:
+            st.markdown("### Research History")
+            st.markdown("#### Detailed History")
+            messages = st.session_state.main_memory.load_memory_variables({})["chat_history"]
+            for msg in messages:
+                st.text(f"{msg.type}: {msg.content}")
+
+            st.markdown("#### Summary")
+            summary = st.session_state.summary_memory.load_memory_variables({})["summary_history"]
+            st.write(summary)
 
 
 if __name__ == '__main__':
